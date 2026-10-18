@@ -45,10 +45,10 @@ class WeatherProviderError(Exception):
 class NormalizedWeather:
     """Seven production model weather inputs plus acquisition provenance.
 
-    Units match the ASHRAE fields used to train v1.0.0: Celsius, oktas (0–9),
-    inches for hourly precipitation, hPa, degrees, and m/s. OpenWeather metric
-    mode supplies Celsius/m/s and hPa; clouds percent are scaled to oktas and
-    rain mm is converted to inches. Missing provider fields stay None.
+    Confirmed units match the ASHRAE v1.0.0 contract: Celsius, millimeters per
+    one-hour period, hPa, degrees, and m/s. Cloud coverage stays unavailable
+    because OpenWeather percentage has no established ASHRAE conversion.
+    Missing or semantically incompatible provider fields stay None.
     """
 
     air_temperature: float | None
@@ -88,7 +88,11 @@ class OpenWeatherProvider:
     async def retrieve(
         self, latitude: float, longitude: float, *, mode: WeatherMode = "current"
     ) -> NormalizedWeather:
-        """Retrieve current conditions or the nearest forecast record."""
+        """Retrieve current conditions or the nearest forecast record.
+
+        TODO: Define an explicit timezone policy for aligning provider records
+        with V1's timezone-naive hourly timestamps before prediction integration.
+        """
         if mode not in self._ENDPOINTS:
             raise ValueError("Unsupported weather retrieval mode.")
         if not self._settings.weather_api_key.get_secret_value():
@@ -133,12 +137,7 @@ class OpenWeatherProvider:
     ) -> NormalizedWeather:
         main = record.get("main") or {}
         wind = record.get("wind") or {}
-        clouds = record.get("clouds") or {}
         rain = record.get("rain") or {}
-    # OpenWeather /forecast reports accumulated rain.3h; use its hourly
-        # average to match the training field's one-hour precipitation depth.
-        rain_key = "1h" if mode == "current" else "3h"
-        rain_factor = 1 / 25.4 if mode == "current" else 1 / (3 * 25.4)
         timestamp = record.get("dt")
         observed_at = (
             datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
@@ -147,20 +146,17 @@ class OpenWeatherProvider:
         )
         return NormalizedWeather(
             air_temperature=_optional_float(main.get("temp")),
-            cloud_coverage=(
-                float(clouds["all"]) * 9 / 100 if clouds.get("all") is not None else None
-            ),
+            # OpenWeather reports percentage cloudiness; no V1 ASHRAE mapping
+            # has been established, so do not represent it as cloud coverage.
+            cloud_coverage=None,
             dew_temperature=_optional_float(main.get("dew_point")),
             precip_depth_1_hr=(
-                float(rain[rain_key]) * rain_factor
-                if rain.get(rain_key) is not None
+                float(rain["1h"])
+                if mode == "current" and rain.get("1h") is not None
                 else None
             ),
-            # The standard 2.5 endpoint generally returns `pressure`; newer
-            # payloads may additionally distinguish `sea_level`. Both are hPa.
-            sea_level_pressure=_optional_float(
-                main.get("sea_level", main.get("pressure"))
-            ),
+            # Generic `pressure` is not a safe substitute for sea-level pressure.
+            sea_level_pressure=_optional_float(main.get("sea_level")),
             wind_direction=_optional_float(wind.get("deg")),
             wind_speed=_optional_float(wind.get("speed")),
             provider="openweather",
